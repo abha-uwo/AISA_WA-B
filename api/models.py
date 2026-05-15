@@ -15,6 +15,15 @@ class Client(models.Model):
     whatsapp_waba_id = models.CharField(max_length=100, null=True, blank=True)
     whatsapp_verify_token = models.CharField(max_length=100, null=True, blank=True)
     
+    # Global Greeting Message
+    greeting_enabled = models.BooleanField(default=False)
+    greeting_message = models.TextField(null=True, blank=True)
+    greeting_buttons = models.JSONField(default=list, blank=True)
+    
+    # AI Assistant Config
+    ai_enabled = models.BooleanField(default=False)
+    ai_context = models.TextField(null=True, blank=True) # Description of business/platform for the AI
+    
     # Config as JSON
     facebook_config = models.JSONField(default=dict, blank=True)
     instagram_config = models.JSONField(default=dict, blank=True)
@@ -54,6 +63,7 @@ class Automation(models.Model):
     trigger_type = models.CharField(max_length=20, choices=TRIGGER_CHOICES, default='KEYWORD')
     keywords = models.JSONField(default=list, blank=True)
     response = models.TextField()
+    buttons = models.JSONField(default=list, blank=True) # Optional buttons (max 3)
     channels = models.JSONField(default=list, blank=True)  # e.g., ["WHATSAPP"]
     enabled = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -109,3 +119,12 @@ class Log(models.Model):
     action = models.CharField(max_length=255)
     details = models.TextField()
     timestamp = models.DateTimeField(auto_now_add=True)
+
+class GlobalSetting(models.Model):
+    key = models.CharField(max_length=100, unique=True)
+    value = models.TextField()
+    file = models.FileField(upload_to='legal/', null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.key

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import User, Client, Automation, Workflow
+from .models import User, Client, Automation, Workflow, GlobalSetting
 
 class ClientSerializer(serializers.ModelSerializer):
     _id = serializers.SerializerMethodField()
@@ -51,3 +51,8 @@ class RegisterSerializer(serializers.Serializer):
             client=client
         )
         return user
+
+class GlobalSettingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GlobalSetting
+        fields = '__all__'

@@ -10,6 +10,7 @@ from .models import User, Client, Automation, Message, Workflow
 import requests
 import os
 import json
+from .ai_utils import get_ai_response, get_platform_assistance
 
 class RegisterView(views.APIView):
     permission_classes = [] 
@@ -148,9 +149,8 @@ class ProfileView(APIView):
             return Response(serializer.data)
         return Response(serializer.errors, status=400)
 
-from rest_framework.views import APIView
-from rest_framework.permissions import IsAdminUser
-from .models import Client, Automation, Workflow
+from .models import User, Client, Automation, Workflow, GlobalSetting
+from .serializers import RegisterSerializer, UserSerializer, ClientSerializer, AutomationSerializer, WorkflowSerializer, GlobalSettingSerializer
 
 class AdminStatsView(APIView):
     permission_classes = [IsAdminUser]
@@ -161,6 +161,70 @@ class AdminStatsView(APIView):
             "activeAutomations": Automation.objects.filter(enabled=True).count(),
             "totalWorkflows": Workflow.objects.count(),
         })
+
+class GlobalSettingsView(APIView):
+    def get_permissions(self):
+        if self.request.method == 'GET':
+            return []
+        return [IsAdminUser()]
+
+    def get(self, request):
+        key = request.query_params.get('key')
+        if key:
+            setting = GlobalSetting.objects.filter(key=key).first()
+            if setting:
+                return Response(GlobalSettingSerializer(setting).data)
+            return Response({"value": ""})
+        
+        settings = GlobalSetting.objects.all()
+        return Response(GlobalSettingSerializer(settings, many=True).data)
+
+    def post(self, request):
+        key = request.data.get('key')
+        value = request.data.get('value', '')
+        file = request.FILES.get('file') or request.data.get('file')
+        delete_file = request.data.get('delete_file') == 'true'
+        
+        setting, created = GlobalSetting.objects.update_or_create(
+            key=key,
+            defaults={'value': value}
+        )
+        
+        if delete_file:
+            setting.file = None
+            setting.save()
+        elif file and not isinstance(file, str):
+            setting.file = file
+            setting.save()
+            
+            # Extract text from file and update value automatically
+            try:
+                import docx
+                import PyPDF2
+                import io
+
+                ext = os.path.splitext(file.name)[1].lower()
+                extracted_text = ""
+
+                if ext == '.docx':
+                    doc = docx.Document(file)
+                    # Join paragraphs with line breaks
+                    extracted_text = "<br />".join([para.text for para in doc.paragraphs if para.text.strip()])
+                elif ext == '.pdf':
+                    pdf_reader = PyPDF2.PdfReader(file)
+                    full_text = ""
+                    for page in pdf_reader.pages:
+                        full_text += page.extract_text() + "\n"
+                    # Convert newlines to HTML line breaks
+                    extracted_text = full_text.strip().replace('\n', '<br />')
+
+                if extracted_text.strip():
+                    setting.value = extracted_text
+                    setting.save()
+            except Exception as e:
+                print(f"Error extracting text from file: {str(e)}")
+            
+        return Response(GlobalSettingSerializer(setting).data)
 
 class AdminAutomationsView(APIView):
     permission_classes = [IsAdminUser]
@@ -280,7 +344,19 @@ class WhatsAppWebhookView(APIView):
                         messages = value.get('messages', [])
                         for msg in messages:
                             from_number = msg.get('from')
-                            body = msg.get('text', {}).get('body', '')
+                            msg_type = msg.get('type')
+                            body = ""
+
+                            if msg_type == 'text':
+                                body = msg.get('text', {}).get('body', '')
+                            elif msg_type == 'button':
+                                body = msg.get('button', {}).get('text', '')
+                            elif msg_type == 'interactive':
+                                i_type = msg.get('interactive', {}).get('type')
+                                if i_type == 'button_reply':
+                                    body = msg.get('interactive', {}).get('button_reply', {}).get('title', '')
+                                elif i_type == 'list_reply':
+                                    body = msg.get('interactive', {}).get('list_reply', {}).get('title', '')
                             
                             # Log the message
                             Message.objects.create(
@@ -291,11 +367,13 @@ class WhatsAppWebhookView(APIView):
                                 body=body,
                                 message_type='INCOMING',
                                 whatsapp_message_id=msg.get('id'),
-                                status='RECEIVED'
+                                status='RECEIVED',
+                                metadata=msg # Store full payload for debugging
                             )
 
-                            # Handle Automations
-                            self.handle_automations(client, from_number, body, phone_number_id)
+                            # Handle Automations with the extracted text
+                            if body:
+                                self.handle_automations(client, from_number, body, phone_number_id)
 
             return Response({"status": "success"}, status=status.HTTP_200_OK)
         except Exception as e:
@@ -304,39 +382,74 @@ class WhatsAppWebhookView(APIView):
 
     def handle_automations(self, client, to_number, incoming_text, phone_number_id):
         """
-        Matches keywords and sends automated responses
+        Matches keywords and sends automated responses.
+        If no keyword matches, sends the Global Greeting Message if enabled.
         """
-        automations = Automation.objects.filter(client=client, enabled=True)
+        automations = Automation.objects.filter(client=client, enabled=True, trigger_type='KEYWORD')
         incoming_text_lower = incoming_text.lower().strip()
-
+        
+        match_found = False
+        # 1. Try Keyword Matching
         for auto in automations:
-            # Check keywords (stored as a list in JSONField)
-            match_found = False
             if auto.keywords:
                 for keyword in auto.keywords:
                     if keyword.lower().strip() == incoming_text_lower:
+                        self.send_whatsapp_message(client, to_number, auto.response, phone_number_id, auto.buttons)
                         match_found = True
                         break
-            
-            if match_found:
-                self.send_whatsapp_message(client, to_number, auto.response, phone_number_id)
-                break # Only send one response for now
+            if match_found: break
 
-    def send_whatsapp_message(self, client, to_number, text_body, phone_number_id):
+        # 2. If no keyword matched, check AI Assistant
+        if not match_found and client.ai_enabled:
+            ai_reply = get_ai_response(incoming_text, client.ai_context)
+            if ai_reply:
+                self.send_whatsapp_message(client, to_number, ai_reply, phone_number_id)
+                match_found = True
+
+        # 3. If still no match, check Global Greeting Message
+        if not match_found and client.greeting_enabled and client.greeting_message:
+            self.send_whatsapp_message(client, to_number, client.greeting_message, phone_number_id, client.greeting_buttons)
+
+    def send_whatsapp_message(self, client, to_number, text_body, phone_number_id, buttons=None):
         """
-        Calls Meta Graph API to send a text message
+        Calls Meta Graph API to send a text or interactive message
         """
         url = f"https://graph.facebook.com/{os.getenv('WHATSAPP_API_VERSION', 'v19.0')}/{phone_number_id}/messages"
         headers = {
             "Authorization": f"Bearer {client.whatsapp_access_token}",
             "Content-Type": "application/json"
         }
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_number,
-            "type": "text",
-            "text": {"body": text_body}
-        }
+        
+        # Prepare payload
+        if buttons and len(buttons) > 0:
+            # Construct Interactive Buttons (Max 3)
+            buttons_payload = []
+            for i, btn_text in enumerate(buttons[:3]):
+                buttons_payload.append({
+                    "type": "reply",
+                    "reply": {
+                        "id": f"btn_{i}",
+                        "title": btn_text[:20] # Meta limit: 20 chars
+                    }
+                })
+            
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to_number,
+                "type": "interactive",
+                "interactive": {
+                    "type": "button",
+                    "body": {"text": text_body},
+                    "action": {"buttons": buttons_payload}
+                }
+            }
+        else:
+            payload = {
+                "messaging_product": "whatsapp",
+                "to": to_number,
+                "type": "text",
+                "text": {"body": text_body}
+            }
 
         try:
             response = requests.post(url, headers=headers, json=payload)
@@ -352,7 +465,8 @@ class WhatsAppWebhookView(APIView):
                 body=text_body,
                 message_type='OUTGOING',
                 whatsapp_message_id=res_data.get('messages', [{}])[0].get('id') if 'messages' in res_data else None,
-                status='SENT' if response.status_code == 200 else 'FAILED'
+                status='SENT' if response.status_code == 200 else 'FAILED',
+                metadata=payload
             )
         except Exception as e:
             print(f"Failed to send message: {str(e)}")
@@ -378,6 +492,17 @@ class ClientMessagesView(APIView):
                 "created_at": msg.created_at
             })
         return Response(data)
+
+class PlatformAssistantView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        query = request.data.get('query')
+        if not query:
+            return Response({"message": "Query is required"}, status=400)
+        
+        response = get_platform_assistance(query)
+        return Response({"response": response})
 
 def root_view(request):
     return HttpResponse("Aisaconnect Python API is running...")
